@@ -8,6 +8,7 @@ typedef enum {
     ERR_FILE_OPEN    = 3,
     ERR_FILE_FORMAT  = 4,
     ERR_TASK_SPEC    = 5,
+    ERR_INTERNAL     = 6,
 } ErrorCode;
 
 #endif /* ERRORS_H */
