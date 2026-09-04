@@ -48,6 +48,33 @@ static int select_running_task(const Task *tasks, const TaskState *states,
     return best;
 }
 
+static void activate_arrivals(const Task *tasks, TaskState *states, int n,
+                               int t) {
+    for (int i = 0; i < n; i++) {
+        if (states[i].next_arrival == t) {
+            states[i].has_instance = 1;
+            states[i].remaining_burst = tasks[i].burst;
+            states[i].absolute_deadline = t + tasks[i].deadline;
+            states[i].next_arrival = t + tasks[i].period;
+        }
+    }
+}
+
+/* Remove da disputa, sem gerar linha de log, tarefas que perderam o
+ * deadline enquanto aguardavam (nao estavam de fato usando a CPU). A
+ * tarefa em execucao (running) e tratada a parte, pois sua eventual
+ * perda de deadline gera uma linha de log (- L). */
+static void reap_waiting_losses(TaskState *states, int n, int t,
+                                 int running) {
+    for (int i = 0; i < n; i++) {
+        if (i == running) continue;
+        if (states[i].has_instance && states[i].absolute_deadline <= t) {
+            states[i].has_instance = 0;
+            states[i].lost_count++;
+        }
+    }
+}
+
 void run_simulation(const Task *tasks, TaskState *states, int n,
                      int total_time, PriorityKeyFn priority_key,
                      SimResult *result) {
@@ -65,26 +92,29 @@ void run_simulation(const Task *tasks, TaskState *states, int n,
     }
 
     int t = 0;
+    int running = -1;
+    int seg_start = 0;
+
     while (t < total_time) {
-        for (int i = 0; i < n; i++) {
-            if (states[i].next_arrival == t) {
-                states[i].has_instance = 1;
-                states[i].remaining_burst = tasks[i].burst;
-                states[i].absolute_deadline = t + tasks[i].deadline;
-                states[i].next_arrival = t + tasks[i].period;
+        activate_arrivals(tasks, states, n, t);
+        reap_waiting_losses(states, n, t, running);
+
+        int best = select_running_task(tasks, states, n, priority_key);
+
+        if (best != running) {
+            int duration = t - seg_start;
+            if (duration > 0) {
+                if (running == -1) {
+                    log_push(&buf, LOG_IDLE, -1, duration);
+                } else {
+                    log_push(&buf, LOG_PREEMPTED, running, duration);
+                }
             }
+            running = best;
+            seg_start = t;
         }
 
-        for (int i = 0; i < n; i++) {
-            if (states[i].has_instance && states[i].absolute_deadline <= t) {
-                states[i].has_instance = 0;
-                states[i].lost_count++;
-            }
-        }
-
-        int running = select_running_task(tasks, states, n, priority_key);
-
-        if (running == -1) {
+        if (best == -1) {
             int next_event = total_time;
             for (int i = 0; i < n; i++) {
                 if (states[i].next_arrival > t &&
@@ -92,7 +122,6 @@ void run_simulation(const Task *tasks, TaskState *states, int n,
                     next_event = states[i].next_arrival;
                 }
             }
-            log_push(&buf, LOG_IDLE, -1, next_event - t);
             t = next_event;
             continue;
         }
@@ -115,22 +144,37 @@ void run_simulation(const Task *tasks, TaskState *states, int n,
         states[running].remaining_burst -= stretch;
 
         if (states[running].remaining_burst == 0) {
-            log_push(&buf, LOG_FINISHED, running, stretch);
+            log_push(&buf, LOG_FINISHED, running, t_new - seg_start);
             states[running].has_instance = 0;
             states[running].completed_count++;
+            running = -1;
+            seg_start = t_new;
         } else if (t_new == states[running].absolute_deadline) {
-            log_push(&buf, LOG_LOST, running, stretch);
+            log_push(&buf, LOG_LOST, running, t_new - seg_start);
             states[running].has_instance = 0;
             states[running].lost_count++;
+            running = -1;
+            seg_start = t_new;
         } else if (t_new == total_time) {
-            log_push(&buf, LOG_KILLED, running, stretch);
+            log_push(&buf, LOG_KILLED, running, t_new - seg_start);
             states[running].has_instance = 0;
             states[running].killed_count++;
-        } else {
-            log_push(&buf, LOG_PREEMPTED, running, stretch);
+            running = -1;
+            seg_start = t_new;
         }
 
         t = t_new;
+    }
+
+    if (seg_start < total_time) {
+        int duration = total_time - seg_start;
+        if (running == -1) {
+            log_push(&buf, LOG_IDLE, -1, duration);
+        } else {
+            log_push(&buf, LOG_KILLED, running, duration);
+            states[running].has_instance = 0;
+            states[running].killed_count++;
+        }
     }
 
     for (int i = 0; i < n; i++) {
